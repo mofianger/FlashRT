@@ -310,7 +310,7 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
 
 def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
                             scales_dev, *, attn=None, stream: int = 0,
-                            use_fp8=True) -> None:
+                            use_fp8=True, layers_subset=None) -> None:
     """3 deepstack mergers — taps ViT layers ``[5, 11, 17]`` and produces
     3 features for DeepStack injection into LLM layers ``[0, 1, 2]``.
 
@@ -356,7 +356,8 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
     fp8_scratch = int(bufs["fp8_scratch"])
     fc1_out     = int(bufs["fc1_out"])
 
-    for j in range(3):
+    layer_iter = range(3) if layers_subset is None else list(layers_subset)
+    for j in layer_iter:
         in_ptr  = int(bufs["in"][j])
         out_ptr = int(bufs["out"][j])
 
