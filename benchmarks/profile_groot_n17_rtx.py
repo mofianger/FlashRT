@@ -323,7 +323,7 @@ def main():
                          + sum(flops["dit"](dit_dims, layer)
                                for layer in range(32)))
 
-    if not hasattr(fe, "_k_dit_fwd"):
+    if not hasattr(fe, "_kdit_fwd"):
         raise RuntimeError("action CUDA graph setup did not expose the kernel forward")
 
     def run_eager_profile_pass():
@@ -343,11 +343,11 @@ def main():
                      flops["cross_kv"]())
         fe._k_state_in.copy_(state.reshape(1, 132).to(device).bfloat16())
         fe._k_actions.copy_(noise.reshape(args.horizon, 132))
-        _record_call(records, "state_encode", lambda: fe._k_dit_fwd[0](0),
+        _record_call(records, "state_encode", lambda: fe._kdit_fwd[0](0),
                      flops["state_encode"]())
         for step in range(fe._k_nsteps):
             start, end = _event_pair(torch.cuda.current_stream())
-            fe._k_dit_fwd[1](step, 0)
+            fe._kdit_fwd[1](step, 0)
             end.record(torch.cuda.current_stream())
             records[f"action_step_{step}_inclusive"].append(
                 (start, end, action_step_flops))
