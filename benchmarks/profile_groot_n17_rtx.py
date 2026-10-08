@@ -228,6 +228,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True, help="GR00T N1.7 checkpoint")
     ap.add_argument("--aux", required=True, help="256x256 *_llm_aux.pt")
+    ap.add_argument("--fixture", default=None,
+                    help="reference fixture used to load the matching robot state; "
+                         "defaults to the aux filename without _llm_aux")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--horizon", type=int, default=40)
@@ -238,47 +241,81 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("This profiler must run on the CUDA server")
-    aux = torch.load(args.aux, map_location="cpu", weights_only=False)
+    aux_path = Path(args.aux)
+    aux = torch.load(aux_path, map_location="cpu", weights_only=False)
     if isinstance(aux, list):
         aux = aux[0]
-    from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
-        GrootN17TorchFrontendThorFP8,
-    )
-    from flash_rt.models.groot_n17 import pipeline_thor
+    fixture_path = (Path(args.fixture) if args.fixture else
+                    aux_path.with_name(aux_path.stem.removesuffix("_llm_aux") + ".pt"))
+    fixture = torch.load(fixture_path, map_location="cpu", weights_only=False)
 
-    fe = GrootN17TorchFrontendThorFP8(
+    from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
+        GrootN17TorchFrontendRtxFP8,
+    )
+    from flash_rt.models.groot_n17 import pipeline_rtx_fp8, pipeline_thor
+
+    fe = GrootN17TorchFrontendRtxFP8(
         args.ckpt, num_views=args.views,
         embodiment_tag="oxe_droid_relative_eef_relative_joint")
+    aux = {k: (v.cuda() if isinstance(v, torch.Tensor) else v)
+           for k, v in aux.items()}
     fe.set_prompt(aux=aux, prompt="profile")
     device = fe.device
-    state = torch.zeros(1, 1, 132, dtype=torch.float32)
+    state_dict = {"state." + k: v for k, v in fixture["inputs"]["state"].items()}
+    state = fe.normalize_state(state_dict).to(device)
     noise = aux["initial_noise"].to(device).bfloat16().contiguous()
 
     # Warm up/capture production graphs before taking the baseline.
     for _ in range(max(args.warmup, 2)):
-        fe._backbone_features = fe.run_backbone_graph(aux)
-        fe.infer(state, initial_noise=noise.clone(), action_horizon=args.horizon)
+        fe.infer(state, aux=aux, initial_noise=noise,
+                 action_horizon=args.horizon, use_dit_graph=True)
     torch.cuda.synchronize()
 
-    # Production-path reference: graph replay, synchronized wall time, matching
-    # the existing GROOT benchmark's backbone + action timing boundaries.
+    # Production-path reference: same RTX FP8 frontend and whole-infer timing
+    # as the existing 5090 benchmark, plus a synchronized stage split.
     baseline = defaultdict(list)
     for _ in range(args.iters):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        fe._backbone_features = fe.run_backbone_graph(aux)
+        full_start = torch.cuda.Event(enable_timing=True)
+        full_end = torch.cuda.Event(enable_timing=True)
+        full_start.record()
+        fe.infer(state, aux=aux, initial_noise=noise,
+                 action_horizon=args.horizon, use_dit_graph=True)
+        full_end.record()
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        fe.infer(state, initial_noise=noise.clone(), action_horizon=args.horizon)
+        baseline["e2e_gpu_event_ms"].append(full_start.elapsed_time(full_end))
+        baseline["e2e_wall_ms"].append((t1 - t0) * 1000.0)
+
+        bb_start, bb_end = (torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True))
         torch.cuda.synchronize()
-        t2 = time.perf_counter()
+        t0 = time.perf_counter()
+        bb_start.record()
+        fe._backbone_features = fe.run_backbone_graph(aux)
+        bb_end.record()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        baseline["backbone_graph_gpu_event_ms"].append(bb_start.elapsed_time(bb_end))
         baseline["backbone_graph_wall_ms"].append((t1 - t0) * 1000.0)
-        baseline["action_graph_wall_ms"].append((t2 - t1) * 1000.0)
-        baseline["e2e_wall_ms"].append((t2 - t0) * 1000.0)
+
+        act_start, act_end = (torch.cuda.Event(enable_timing=True),
+                              torch.cuda.Event(enable_timing=True))
+        t0 = time.perf_counter()
+        act_start.record()
+        fe.infer(state, initial_noise=noise, action_horizon=args.horizon,
+                 use_dit_graph=True)
+        act_end.record()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        baseline["action_graph_gpu_event_ms"].append(act_start.elapsed_time(act_end))
+        baseline["action_graph_wall_ms"].append((t1 - t0) * 1000.0)
 
     flops = _make_flop_functions(fe, aux, args.horizon)
     records = defaultdict(list)
-    originals = _install_layer_timers(pipeline_thor, records, flops)
+    originals = _install_layer_timers(pipeline_rtx_fp8, records, flops)
+    action_originals = _install_layer_timers(pipeline_thor, records, flops)
     dit_dims = {"Sa": args.horizon + 1, "D": 1536, "FF": 6144,
                 "Skv_text": flops["shape"]["text_tokens"],
                 "Skv_image": flops["shape"]["image_tokens"]}
@@ -299,9 +336,8 @@ def main():
         fe._kbb_forward(0)
         fe._backbone_features = fe._kbb_vlsa_h.unsqueeze(0)
 
-        # The production action graph refreshes cross-attention K/V, encodes
-        # state, then runs four action steps. Replay those same kernel closures
-        # eagerly; the DIT wrapper still uses the graph-prepared FP8 weights.
+        # Replay the same action kernel closures as the captured RTX call. The
+        # per-layer DIT calls still use the prepared production weights.
         fe._ck_bb_src.copy_(fe._backbone_features.reshape(fe.Se, 2048).half())
         _record_call(records, "cross_kv_refresh", lambda: fe._cross_kv_fwd(0),
                      flops["cross_kv"]())
@@ -325,6 +361,8 @@ def main():
         torch.cuda.synchronize()
 
     for name, original in originals.items():
+        setattr(pipeline_rtx_fp8, name, original)
+    for name, original in action_originals.items():
         setattr(pipeline_thor, name, original)
 
     rows = _summarize(records)
@@ -359,7 +397,8 @@ def main():
     baseline_summary = {name: _stats(values) for name, values in baseline.items()}
     report = {
         "device": torch.cuda.get_device_name(),
-        "profile_mode": "FP8 kernels; graph baseline + eager per-layer diagnostic",
+        "frontend": type(fe).__name__,
+        "profile_mode": "RTX FP8 frontend; graph baseline + eager per-layer diagnostic",
         "aux_contract": "pixel_features + llm_input_embeds; raw pixels absent",
         "shape": flops["shape"],
         "warmup": args.warmup,
@@ -400,4 +439,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with torch.no_grad():
+        main()
