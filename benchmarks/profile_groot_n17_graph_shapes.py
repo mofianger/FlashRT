@@ -139,6 +139,25 @@ class CaptureTrace:
                         "logical_output": [m, n]})
         self.operations.append(row)
 
+    def record_torch(self, name, args, kwargs, result):
+        if not self.capturing():
+            return
+        from torch.utils._pytree import tree_leaves
+
+        def tensors(value):
+            return [{"shape": list(t.shape), "dtype": str(t.dtype),
+                     "stride": list(t.stride())}
+                    for t in tree_leaves(value) if isinstance(t, torch.Tensor)]
+
+        inputs = tensors((args, kwargs))
+        outputs = tensors(result)
+        self.operations.append({"scope": self.scope, "kind": "torch_op",
+                                "operation": str(name),
+                                "dtype": ",".join(sorted({t["dtype"] for t in inputs})),
+                                "layout": "tensor strides in tensor_inputs/outputs",
+                                "shape_args": {}, "layer_dims": self.dims.copy(),
+                                "tensor_inputs": inputs, "tensor_outputs": outputs})
+
     def install_operations(self):
         import flash_rt.flash_rt_kernels as fvk
 
@@ -281,7 +300,17 @@ def main():
     trace.install_operations()
     try:
         fe, state = make_frontend()
-        infer(fe, state)  # lazily captures both graphs
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class CaptureTorchOps(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                result = func(*args, **kwargs)
+                trace.record_torch(func, args, kwargs, result)
+                return result
+
+        with CaptureTorchOps():
+            infer(fe, state)  # lazily captures both graphs
         torch.cuda.synchronize()
         assert len(trace.events) == 24 + 3 + 16 + 1 + 4 + 32 * 4, (
             "unexpected captured layer count", len(trace.events))
@@ -332,6 +361,8 @@ def main():
                                "logical_K": json.dumps(item.get("logical_K", "")),
                                "logical_V": json.dumps(item.get("logical_V", "")),
                                "logical_output": json.dumps(item.get("logical_output", "")),
+                               "tensor_inputs": json.dumps(item.get("tensor_inputs", "")),
+                               "tensor_outputs": json.dumps(item.get("tensor_outputs", "")),
                                "shape_args": json.dumps(item["shape_args"], sort_keys=True),
                                "layer_dims": json.dumps(item["layer_dims"], sort_keys=True)})
     write_csv(out / "operation_shapes.csv", operation_rows)
@@ -357,9 +388,13 @@ def main():
               "backbone_unattributed_mean_ms": statistics.mean(backbone_ms) - bb_layer_ms,
               "action_unattributed_mean_ms": statistics.mean(action_ms) - dit_layer_ms,
               "captured_layers": len(trace.events),
-              "captured_api_calls": len(operation_rows),
+              "captured_operation_records": len(operation_rows),
+              "captured_flashrt_api_calls": sum(row["kind"] != "torch_op"
+                                                for row in operation_rows),
+              "captured_torch_ops": sum(row["kind"] == "torch_op"
+                                         for row in operation_rows),
               "note": "Instrumented graph includes timing event nodes. Residual includes "
-                      "unwrapped ops, copies, event overhead and timing differences; "
+                      "copies, event overhead and timing differences; "
                       "logical GEMM shapes do not prove physical matrix layout."}
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
