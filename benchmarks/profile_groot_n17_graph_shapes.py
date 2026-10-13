@@ -15,7 +15,7 @@ import inspect
 import json
 import re
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import torch
@@ -102,13 +102,35 @@ class CaptureTrace:
         return {k: v for k, v in values.items()
                 if k not in {"stream", "self", "eps"}
                 and isinstance(v, (int, float, bool))
-                and (isinstance(v, bool) or abs(v) <= 1_000_000)}
+                and (isinstance(v, bool) or abs(v) <= 1_000_000_000)}
+
+    @staticmethod
+    def dtype_and_layout(kind, name):
+        if kind == "gemm":
+            if name.startswith("fp8_"):
+                return ("FP8 E4M3 inputs / FP16 output",
+                        "logical row-major NN; cuBLASLt uses swapped col-major operands")
+            if name.startswith("bf16_"):
+                return "BF16 inputs / BF16 output", "row-major NN"
+            if name.startswith("fp16_"):
+                return "FP16 inputs / FP16 output", "row-major NN"
+            if name.startswith("fp4_"):
+                return "NVFP4 inputs / BF16 output", "see GEMM implementation"
+        if "fp8" in name:
+            return "FP8/FP16 mixed", "N/A"
+        if "bf16" in name:
+            return "BF16", "N/A"
+        if "fp16" in name:
+            return "FP16", "N/A"
+        return "unknown", "N/A"
 
     def record(self, kind, name, fn, args, kwargs):
         if not self.capturing():
             return
         dims = self._named_scalars(fn, args, kwargs)
+        dtype, layout = self.dtype_and_layout(kind, name)
         row = {"scope": self.scope, "kind": kind, "operation": name,
+               "dtype": dtype, "layout": layout,
                "shape_args": dims, "layer_dims": self.dims.copy()}
         if kind == "gemm" and all(k in dims for k in ("M", "N", "K")):
             m, n, k = (int(dims[key]) for key in ("M", "N", "K"))
@@ -280,7 +302,9 @@ def main():
     operation_rows = []
     for index, item in enumerate(trace.operations):
         operation_rows.append({"capture_index": index, "scope": item["scope"],
+                               "calls_per_inference": 1,
                                "kind": item["kind"], "operation": item["operation"],
+                               "dtype": item["dtype"], "layout": item["layout"],
                                "M": item.get("M", ""), "N": item.get("N", ""),
                                "K": item.get("K", ""),
                                "logical_A": json.dumps(item.get("logical_A", "")),
@@ -289,6 +313,14 @@ def main():
                                "shape_args": json.dumps(item["shape_args"], sort_keys=True),
                                "layer_dims": json.dumps(item["layer_dims"], sort_keys=True)})
     write_csv(out / "operation_shapes.csv", operation_rows)
+    gemm_counts = Counter(
+        (row["dtype"], row["layout"], row["M"], row["N"], row["K"])
+        for row in operation_rows if row["kind"] == "gemm")
+    write_csv(out / "gemm_shapes.csv", [
+        {"dtype": dtype, "layout": layout, "M": m, "N": n, "K": k,
+         "calls_per_inference": count}
+        for (dtype, layout, m, n, k), count in sorted(
+            gemm_counts.items(), key=lambda pair: -pair[1])])
     bb_layer_ms = sum(row["mean_ms"] for row in layer_rows if row["stage"] != "dit")
     dit_layer_ms = sum(row["mean_ms"] for row in layer_rows if row["stage"] == "dit")
     report = {"frontend": type(fe).__name__, "gpu": torch.cuda.get_device_name(),
