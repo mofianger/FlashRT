@@ -72,8 +72,10 @@ class CaptureTrace:
                                  else f"{_stage}.layer_{layer:02d}")
                         previous = self.scope, self.dims
                         self.scope, self.dims = label, dims
-                        start = torch.cuda.Event(enable_timing=True)
-                        end = torch.cuda.Event(enable_timing=True)
+                        # Graph-internal events encode dependencies only;
+                        # external nodes retain timestamps across replay.
+                        start = torch.cuda.Event(enable_timing=True, external=True)
+                        end = torch.cuda.Event(enable_timing=True, external=True)
                         start.record()
                         try:
                             if _stage == "vlln":
