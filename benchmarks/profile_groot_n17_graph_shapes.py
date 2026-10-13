@@ -181,13 +181,24 @@ class CaptureTrace:
 
         def run(attn, site, layer_idx, *args, **kwargs):
             if trace.capturing():
+                q_seq = int(kwargs.get("q_seq", args[0] if args else 0))
+                kv_seq = int(kwargs.get("kv_seq") or q_seq)
+                q_shape = [1, q_seq, attn.num_q_heads(site), attn.head_dim(site)]
+                kv_shape = [1, kv_seq, attn.num_kv_heads(site), attn.head_dim(site)]
                 trace.operations.append({"scope": trace.scope,
                                          "kind": "attention", "operation": site,
-                                         "dtype": "backend-dependent",
+                                         "dtype": str(attn.dit_self_Q.dtype),
                                          "layout": "attention backend",
+                                         "logical_Q": q_shape,
+                                         "logical_K": kv_shape,
+                                         "logical_V": kv_shape,
+                                         "logical_output": q_shape,
                                          "site_index": layer_idx,
-                                         "shape_args": {k: v for k, v in kwargs.items()
-                                                        if k != "stream"},
+                                         "shape_args": {"q_seq": q_seq,
+                                                        "kv_seq": kv_seq,
+                                                        "num_q_heads": attn.num_q_heads(site),
+                                                        "num_kv_heads": attn.num_kv_heads(site),
+                                                        "head_dim": attn.head_dim(site)},
                                          "layer_dims": trace.dims.copy()})
             return original_run(attn, site, layer_idx, *args, **kwargs)
 
@@ -317,6 +328,9 @@ def main():
                                "K": item.get("K", ""),
                                "logical_A": json.dumps(item.get("logical_A", "")),
                                "logical_B": json.dumps(item.get("logical_B", "")),
+                               "logical_Q": json.dumps(item.get("logical_Q", "")),
+                               "logical_K": json.dumps(item.get("logical_K", "")),
+                               "logical_V": json.dumps(item.get("logical_V", "")),
                                "logical_output": json.dumps(item.get("logical_output", "")),
                                "shape_args": json.dumps(item["shape_args"], sort_keys=True),
                                "layer_dims": json.dumps(item["layer_dims"], sort_keys=True)})
