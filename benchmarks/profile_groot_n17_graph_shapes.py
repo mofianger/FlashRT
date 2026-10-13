@@ -183,6 +183,8 @@ class CaptureTrace:
             if trace.capturing():
                 trace.operations.append({"scope": trace.scope,
                                          "kind": "attention", "operation": site,
+                                         "dtype": "backend-dependent",
+                                         "layout": "attention backend",
                                          "site_index": layer_idx,
                                          "shape_args": {k: v for k, v in kwargs.items()
                                                         if k != "stream"},
@@ -258,6 +260,7 @@ def main():
         output = infer(fe, state)
     torch.cuda.synchronize()
     assert list(output.shape) == [1, 40, 132] and torch.isfinite(output).all()
+    reference_output = output.detach().clone()
     baseline = [event_ms(lambda: infer(fe, state)) for _ in range(args.iters)]
     del fe
     torch.cuda.empty_cache()
@@ -274,6 +277,11 @@ def main():
         trace.restore()  # replay uses captured nodes; no wrappers on the hot path
         for _ in range(args.warmup):
             infer(fe, state)
+        profiled_output = infer(fe, state)
+        torch.cuda.synchronize()
+        assert list(profiled_output.shape) == [1, 40, 132]
+        assert torch.isfinite(profiled_output).all()
+        output_max_abs_diff = (profiled_output - reference_output).abs().max().item()
         samples = defaultdict(list)
         backbone_ms, action_ms, full_ms = [], [], []
         for _ in range(args.iters):
@@ -325,6 +333,7 @@ def main():
     dit_layer_ms = sum(row["mean_ms"] for row in layer_rows if row["stage"] == "dit")
     report = {"frontend": type(fe).__name__, "gpu": torch.cuda.get_device_name(),
               "warmup": args.warmup, "iterations": args.iters,
+              "instrumented_output_max_abs_diff": output_max_abs_diff,
               "uninstrumented_e2e": stats(baseline),
               "instrumented_e2e": stats(full_ms),
               "instrumented_backbone": stats(backbone_ms),
